@@ -1,11 +1,15 @@
 <?php
 
 // Copy this file to platform.local.php (gitignored) and fill in your
-// REAL Paystack secret key. Use a TEST-mode key (sk_test_...) until the
+// REAL Paystack/IntaSend test keys. Use TEST-mode keys (Paystack
+// sk_test_..., IntaSend ISSecretKey_test.../ISPubKey_test...) until the
 // verification checklist has been run end-to-end - never a live key
 // during development.
 
 return [
     'paystack_secret_key' => 'YOUR_TEST_SECRET_KEY',
     'default_percentage_charge' => 10,
+    'intasend_secret_key' => 'YOUR_INTASEND_TEST_SECRET_KEY',
+    'intasend_publishable_key' => 'YOUR_INTASEND_TEST_PUBLISHABLE_KEY',
+    'intasend_webhook_challenge' => 'YOUR_INTASEND_WEBHOOK_CHALLENGE',
 ];

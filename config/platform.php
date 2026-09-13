@@ -32,6 +32,20 @@ $config = [
         'trim',
         explode(',', getenv('PLATFORM_CORS_ALLOWED_ORIGINS') ?: 'https://nexapos-license-1.onrender.com')
     ))),
+    // IntaSend collection (M-Pesa STK push into a per-shop wallet) - see
+    // IntaSendClient's class doc. Use sandbox.intasend.com and
+    // ISSecretKey_test.../ISPubKey_test... keys until verified end-to-end;
+    // never hardcode real values here.
+    'intasend_api_base' => getenv('PLATFORM_INTASEND_API_BASE') ?: 'https://sandbox.intasend.com/api/v1',
+    'intasend_secret_key' => getenv('PLATFORM_INTASEND_SECRET_KEY') ?: '',
+    'intasend_publishable_key' => getenv('PLATFORM_INTASEND_PUBLISHABLE_KEY') ?: '',
+    // Shared secret configured in the IntaSend dashboard's webhook setup
+    // screen - IntaSend echoes it back in every webhook payload's
+    // `challenge` field since it doesn't sign webhooks with an HMAC the
+    // way Paystack does. Never hardcode a real value here.
+    'intasend_webhook_challenge' => getenv('PLATFORM_INTASEND_WEBHOOK_CHALLENGE') ?: '',
+    'intasend_connect_timeout' => (int) (getenv('PLATFORM_INTASEND_CONNECT_TIMEOUT') ?: 25),
+    'intasend_timeout' => (int) (getenv('PLATFORM_INTASEND_TIMEOUT') ?: 60),
 ];
 
 $localConfig = __DIR__ . '/platform.local.php';

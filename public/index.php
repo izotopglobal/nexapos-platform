@@ -18,6 +18,8 @@ use Platform\Core\Database;
 use Platform\Core\InviteCode;
 use Platform\Services\PaystackClient;
 use Platform\Services\PaymentReconciler;
+use Platform\Services\IntaSendClient;
+use Platform\Services\IntaSendReconciler;
 use Platform\Services\MaintenanceService;
 
 /**
@@ -82,6 +84,32 @@ function requireAdmin(array $platformConfig): void
     }
 }
 
+/**
+ * Lazily creates this shop's IntaSend WORKING wallet on first use, so
+ * collecting a payment never needs a separate "set up IntaSend" step the
+ * way Paystack's subaccount does - see IntaSendClient::createWallet's
+ * doc for why no bank details are needed up front. Idempotent: once
+ * shops.intasend_wallet_id is set, every later call just returns it.
+ */
+function ensureIntaSendWallet(PDO $pdo, array $client, IntaSendClient $intasend): string
+{
+    $existing = trim((string) ($client['intasend_wallet_id'] ?? ''));
+    if ($existing !== '') {
+        return $existing;
+    }
+
+    $label = trim((string) ($client['business_name'] ?? '')) ?: ('NexaPOS Shop #' . $client['shop_id']);
+    $result = $intasend->createWallet($label);
+    $walletId = trim((string) ($result['body']['id'] ?? ''));
+    if ($walletId === '') {
+        throw new \RuntimeException('IntaSend did not return a wallet id.');
+    }
+
+    $update = $pdo->prepare('UPDATE shops SET intasend_wallet_id = ? WHERE id = ?');
+    $update->execute([$walletId, $client['shop_id']]);
+    return $walletId;
+}
+
 set_exception_handler(function (\Throwable $e): void {
     error_log('[nexapos_platform] ' . $e->getMessage());
     jsonResponse(['success' => false, 'status' => false, 'message' => 'Server error.'], 500);
@@ -137,6 +165,40 @@ if ($action === 'paystack_webhook' && $method === 'POST') {
         jsonResponse(['success' => false, 'message' => 'Invalid webhook JSON.'], 422);
     } catch (\Throwable $e) {
         error_log('[nexapos_platform] Paystack webhook failed: ' . $e->getMessage());
+        jsonResponse(['success' => false, 'message' => 'Webhook processing will be retried.'], 503);
+    }
+
+    jsonResponse(['success' => true, 'outcome' => $result['outcome']]);
+}
+
+if ($action === 'intasend_webhook' && $method === 'POST') {
+    $rawPayload = (string) file_get_contents('php://input');
+    if ($rawPayload === '' || strlen($rawPayload) > 1_048_576) {
+        jsonResponse(['success' => false, 'message' => 'Invalid webhook payload.'], 422);
+    }
+
+    try {
+        $event = json_decode($rawPayload, true, 32, JSON_THROW_ON_ERROR);
+        if (!is_array($event)) {
+            throw new \RuntimeException('Webhook payload must be an object.');
+        }
+    } catch (\JsonException $e) {
+        jsonResponse(['success' => false, 'message' => 'Invalid webhook JSON.'], 422);
+    }
+
+    if (!IntaSendReconciler::hasValidChallenge(
+        (string) ($event['challenge'] ?? ''),
+        (string) $platformConfig['intasend_webhook_challenge']
+    )) {
+        jsonResponse(['success' => false, 'message' => 'Invalid webhook challenge.'], 401);
+    }
+
+    try {
+        $intasend = new IntaSendClient();
+        $reconciler = new IntaSendReconciler($pdo, [$intasend, 'status']);
+        $result = $reconciler->handleWebhook($event, $rawPayload);
+    } catch (\Throwable $e) {
+        error_log('[nexapos_platform] IntaSend webhook failed: ' . $e->getMessage());
         jsonResponse(['success' => false, 'message' => 'Webhook processing will be retried.'], 503);
     }
 
@@ -876,6 +938,92 @@ if ($action === 'verify_transaction' && $method === 'GET') {
 
     $result = $verification['paystack_result'];
     jsonResponse($result['body'], $result['http_code']);
+}
+
+/**
+ * IntaSend's sibling of initialize_transaction - deliberately has no
+ * subaccount_code-style gate, since collecting into a wallet needs no
+ * settlement details (see ensureIntaSendWallet's doc). Every device in
+ * every shop can accept an IntaSend payment the moment it's registered.
+ */
+if ($action === 'intasend_collect' && $method === 'POST') {
+    $client = Auth::requireClient($pdo);
+    $body = requestBody();
+    $amount = (int) ($body['amount'] ?? 0);
+    $reference = trim((string) ($body['reference'] ?? ''));
+    $phone = trim((string) ($body['phone_number'] ?? ''));
+    $name = trim((string) ($body['name'] ?? '')) ?: null;
+    $email = trim((string) ($body['email'] ?? '')) ?: null;
+
+    // Same upper bound as initialize_transaction, same reasoning.
+    if ($amount < 1 || $amount > 100_000_000 || $reference === '') {
+        jsonResponse(['status' => false, 'message' => 'amount and reference are required.'], 422);
+    }
+    // Kenyan MSISDN in international format (2547xxxxxxxx / 2541xxxxxxxx)
+    // - the shape IntaSend's M-Pesa STK push expects. The app is
+    // expected to have already normalized a local "07xx"/"+254 7xx"
+    // entry before this call; this is a server-side safety net, not the
+    // primary UX validation.
+    if (!preg_match('/^254\d{9}$/', $phone)) {
+        jsonResponse(['status' => false, 'message' => 'Enter a valid M-Pesa number, starting with 254.'], 422);
+    }
+
+    try {
+        $intasend = new IntaSendClient();
+        $walletId = ensureIntaSendWallet($pdo, $client, $intasend);
+        $result = $intasend->mpesaStkPush($amount, $phone, $reference, $name, $email, $walletId);
+    } catch (\Throwable $e) {
+        jsonResponse(['status' => false, 'message' => 'Could not reach IntaSend: ' . $e->getMessage()], 502);
+    }
+
+    $invoice = (array) ($result['body']['invoice'] ?? []);
+    // Both field names seen across IntaSend's own official SDK example
+    // (invoice_id) and their prose docs' sample JSON (id) - see
+    // IntaSendClient's class doc. Accepting either is cheap insurance
+    // against exactly the kind of drift that already happened once.
+    $invoiceId = trim((string) ($invoice['invoice_id'] ?? $invoice['id'] ?? ''));
+    if ($result['http_code'] >= 400 || $invoiceId === '') {
+        $message = (string) ($result['body']['detail'] ?? $result['body']['message'] ?? 'IntaSend did not accept the request.');
+        jsonResponse(['status' => false, 'message' => $message], $result['http_code'] >= 400 ? $result['http_code'] : 502);
+    }
+
+    // Same "don't turn a real charge attempt into a 500" reasoning as
+    // initialize_transaction's own insert - the STK push has already
+    // been sent to the customer's phone by this point.
+    try {
+        $insert = $pdo->prepare('
+            INSERT INTO intasend_transactions (client_id, reference, invoice_id, amount_minor, currency, wallet_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ');
+        $insert->execute([$client['id'], $reference, $invoiceId, $amount, 'KES', $walletId]);
+    } catch (\Throwable $e) {
+        error_log('[nexapos_platform] Could not record intasend transaction (reference=' . $reference . '): ' . $e->getMessage());
+    }
+
+    jsonResponse(['status' => true, 'data' => ['reference' => $reference, 'invoice_id' => $invoiceId]]);
+}
+
+if ($action === 'intasend_status' && $method === 'GET') {
+    $client = Auth::requireClient($pdo);
+    $reference = trim((string) ($_GET['reference'] ?? ''));
+    if ($reference === '') {
+        jsonResponse(['status' => false, 'message' => 'reference is required.'], 422);
+    }
+
+    try {
+        $intasend = new IntaSendClient();
+        $reconciler = new IntaSendReconciler($pdo, [$intasend, 'status']);
+        $verification = $reconciler->verifyForClient($reference, (int) $client['id']);
+    } catch (\Throwable $e) {
+        jsonResponse(['status' => false, 'message' => 'Could not reach IntaSend: ' . $e->getMessage()], 502);
+    }
+
+    if ($verification['outcome'] === 'not_found') {
+        jsonResponse(['status' => false, 'message' => 'Transaction not found.'], 404);
+    }
+
+    $response = $verification['response'];
+    jsonResponse($response['body'], $response['http_code']);
 }
 
 jsonResponse(['success' => false, 'status' => false, 'message' => 'Unknown action.'], 404);

@@ -22,6 +22,31 @@ The endpoint validates `X-Paystack-Signature`, verifies the transaction with
 Paystack, checks reference, amount, and currency, and records an idempotency
 key before updating the local transaction.
 
+## IntaSend collection
+
+Set `PLATFORM_INTASEND_SECRET_KEY`, `PLATFORM_INTASEND_PUBLISHABLE_KEY`, and
+`PLATFORM_INTASEND_WEBHOOK_CHALLENGE` before any device can use the IntaSend
+button. Use `PLATFORM_INTASEND_API_BASE=https://sandbox.intasend.com/api/v1`
+with sandbox keys until verified end-to-end; the live base is
+`https://payment.intasend.com/api/v1`.
+
+Configure the IntaSend dashboard's webhook destination URL as:
+
+`https://<platform-host>/index.php?action=intasend_webhook`
+
+and set its "challenge" field to the same value as
+`PLATFORM_INTASEND_WEBHOOK_CHALLENGE`. Unlike Paystack, IntaSend does not sign
+webhook bodies with an HMAC - it echoes the configured challenge string back
+in every payload's `challenge` field instead, and the endpoint re-fetches the
+transaction's authoritative status from IntaSend before trusting it either
+way. IntaSend deactivates a webhook after 20 consecutive failed deliveries and
+requires contacting their support to re-activate it.
+
+There is currently no disbursement/payout step: money collected into a shop's
+IntaSend wallet stays IntaSend-held until that is built (paused pending
+IntaSend's answer on whether automatic, no-manual-approval payouts are
+available for this account).
+
 ## Database TLS
 
 Upload the provider CA chain as `/etc/secrets/db-ca.pem`. Whenever `DB_SSL_CA`
