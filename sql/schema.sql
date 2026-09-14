@@ -56,6 +56,20 @@ CREATE TABLE IF NOT EXISTS clients (
     -- specific action that needed gating, not a general permissions
     -- model the product doesn't otherwise have.
     is_owner TINYINT(1) NOT NULL DEFAULT 0,
+    -- Stamped once at register_device time from what the client itself
+    -- claims to be, never touched again (same immutable-after-creation
+    -- pattern as is_owner above) - the browser build always sends
+    -- 'browser', native always sends 'native' or omits this entirely
+    -- (defaults to 'native'). Settlement/payout endpoints refuse a
+    -- 'browser' channel outright regardless of is_owner or role - see
+    -- save_settlement_details/client_status/list_banks in public/
+    -- index.php. Defense-in-depth, not cryptographically unbeatable: a
+    -- browser build's client-side code is inherently inspectable/
+    -- patchable in a way a compiled native binary isn't, so this stops
+    -- casual/accidental exposure, not a determined attacker willing to
+    -- rebuild the web client - an accepted, deliberate trade-off, see
+    -- the browser-POS plan.
+    channel ENUM('native', 'browser') NOT NULL DEFAULT 'native',
     shop_id INT NOT NULL,
     -- Client-scoped, unlike settlement above: only means "still within
     -- its 10-min re-registration grace window" or "admin-disabled" - not

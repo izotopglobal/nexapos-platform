@@ -313,6 +313,13 @@ if ($action === 'register_device' && $method === 'POST') {
     // old to send one simply can't use the grace-window retry path,
     // which is the intended, safer behavior, not a bug.
     $registrationSecret = trim((string) ($body['registration_secret'] ?? ''));
+    // Stamped once here, on the brand-new-shop INSERT path only, and
+    // never touched again - same immutable-after-creation pattern as
+    // is_owner just below. An unrecognized value (or none - every native
+    // build predating this field) is treated as 'native', so this is
+    // opt-in for the browser build specifically, never something a
+    // client can accidentally leave itself gated out of.
+    $channel = ($body['channel'] ?? '') === 'browser' ? 'browser' : 'native';
     if ($deviceId === '') {
         jsonResponse(['success' => false, 'message' => 'device_id is required.'], 422);
     }
@@ -369,8 +376,8 @@ if ($action === 'register_device' && $method === 'POST') {
                 $registrationSecretHash = hash('sha256', $registrationSecret);
                 $pdo->exec('INSERT INTO shops () VALUES ()');
                 $shopId = (int) $pdo->lastInsertId();
-                $insert = $pdo->prepare('INSERT INTO clients (device_id, device_label, api_key_hash, registration_secret_hash, shop_id, is_owner) VALUES (?, ?, ?, ?, ?, 1)');
-                $insert->execute([$deviceId, $deviceLabel, $apiKeyHash, $registrationSecretHash, $shopId]);
+                $insert = $pdo->prepare('INSERT INTO clients (device_id, device_label, api_key_hash, registration_secret_hash, shop_id, is_owner, channel) VALUES (?, ?, ?, ?, ?, 1, ?)');
+                $insert->execute([$deviceId, $deviceLabel, $apiKeyHash, $registrationSecretHash, $shopId, $channel]);
             }
             $pdo->commit();
             break;
@@ -763,6 +770,14 @@ if ($action === 'save_settlement_details' && $method === 'POST') {
     if (!$client['is_owner']) {
         jsonResponse(['success' => false, 'message' => 'Only the device that originally set up this shop can change settlement details.'], 403);
     }
+    // Independent of is_owner above, not a replacement for it: a browser
+    // build's own first-run setup could otherwise register a brand-new
+    // shop and legitimately BE its owner - the channel gate exists
+    // specifically so "owner" still isn't enough once the device is a
+    // browser tab. See clients.channel's own schema comment.
+    if ($client['channel'] === 'browser') {
+        jsonResponse(['success' => false, 'message' => 'Settlement details cannot be changed from a browser session. Use the installed app on a phone or PC instead.'], 403);
+    }
 
     $body = requestBody();
     $businessName = trim((string) ($body['business_name'] ?? ''));
@@ -816,17 +831,26 @@ if ($action === 'save_settlement_details' && $method === 'POST') {
 
 if ($action === 'client_status' && $method === 'GET') {
     $client = Auth::requireClient($pdo);
+    // A browser client never sees where a shop's money actually goes -
+    // not even read-only, not even as the shop's own owner (see
+    // save_settlement_details' matching gate and clients.channel's
+    // schema comment for why is_owner alone isn't the boundary here).
+    // shop_id/status/is_owner stay - every other consumer of this
+    // response (sync_service.dart, license_service.dart,
+    // shop_safety_service.dart) only ever reads those three fields, never
+    // the settlement ones, confirmed by inspection before adding this.
+    $isBrowser = $client['channel'] === 'browser';
     jsonResponse([
         'success' => true,
         'shop_id' => (int) $client['shop_id'],
         'status' => $client['status'],
-        'business_name' => $client['business_name'],
-        'settlement_type' => $client['settlement_type'],
-        'bank_code' => $client['bank_code'],
-        'account_number' => $client['account_number'],
-        'account_name' => $client['account_name'],
-        'subaccount_code' => $client['subaccount_code'],
-        'is_verified' => (bool) $client['is_verified'],
+        'business_name' => $isBrowser ? null : $client['business_name'],
+        'settlement_type' => $isBrowser ? null : $client['settlement_type'],
+        'bank_code' => $isBrowser ? null : $client['bank_code'],
+        'account_number' => $isBrowser ? null : $client['account_number'],
+        'account_name' => $isBrowser ? null : $client['account_name'],
+        'subaccount_code' => $isBrowser ? null : $client['subaccount_code'],
+        'is_verified' => $isBrowser ? false : (bool) $client['is_verified'],
         // Lets the app show/hide or disable the settlement form up
         // front instead of a non-owner device filling it in and only
         // then hitting save_settlement_details' 403.
@@ -835,7 +859,13 @@ if ($action === 'client_status' && $method === 'GET') {
 }
 
 if ($action === 'list_banks' && $method === 'GET') {
-    Auth::requireClient($pdo);
+    $client = Auth::requireClient($pdo);
+    // No legitimate reason a browser client would ever need this list -
+    // it only exists to populate save_settlement_details' form, which is
+    // already unconditionally blocked for this channel above.
+    if ($client['channel'] === 'browser') {
+        jsonResponse(['success' => false, 'message' => 'Not available from a browser session.'], 403);
+    }
 
     try {
         $result = (new PaystackClient())->listBanks();

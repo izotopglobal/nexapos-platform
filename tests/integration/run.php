@@ -81,13 +81,17 @@ function concurrentRequests(string $baseUrl, array $specs): array
     return $responses;
 }
 
-function register(string $baseUrl, string $deviceId): array
+function register(string $baseUrl, string $deviceId, ?string $channel = null): array
 {
-    return request($baseUrl, 'register_device', 'POST', [
+    $body = [
         'device_id' => $deviceId,
         'device_label' => $deviceId,
         'registration_secret' => 'secret-' . $deviceId,
-    ]);
+    ];
+    if ($channel !== null) {
+        $body['channel'] = $channel;
+    }
+    return request($baseUrl, 'register_device', 'POST', $body);
 }
 
 $baseUrl = getenv('TEST_PLATFORM_URL') ?: 'http://127.0.0.1:8080/index.php';
@@ -182,5 +186,51 @@ $deleted = $maintenance->run();
 check($deleted['sync_changes'] === 1, 'Sync compaction did not delete exactly one superseded revision.');
 check((int) $pdo->query("SELECT COUNT(*) FROM sync_changes WHERE row_id = 'compact-row'")->fetchColumn() === 1, 'Sync compaction removed the latest row.');
 check($deleted['join_attempts'] >= 1, 'Old join attempts were not pruned.');
+
+// Browser-POS channel gate: a browser-registered device must never
+// reach settlement/payout data, even as its own shop's owner (a
+// brand-new device with no invite code always owns the shop it
+// registers) - see clients.channel's own schema comment for why
+// is_owner alone isn't the boundary here.
+$browserOwner = register($baseUrl, 'browser-owner-device', 'browser');
+check($browserOwner['status'] === 201, 'Could not register the browser-channel fixture.');
+$browserKey = $browserOwner['body']['api_key'];
+$browserStatus = request($baseUrl, 'client_status', 'GET', null, ['Authorization: Bearer ' . $browserKey]);
+check($browserStatus['status'] === 200 && ($browserStatus['body']['is_owner'] ?? false) === true,
+    'A freshly registered device must own its own new shop, regardless of channel.');
+check(
+    // Deliberately not `?? 'sentinel'`: that operator treats an EXISTING
+    // key whose value is a real null the same as a missing key, so it
+    // can't tell "redacted to null" apart from "field absent entirely" -
+    // exactly the distinction this assertion needs to make.
+    array_key_exists('business_name', $browserStatus['body']) && $browserStatus['body']['business_name'] === null
+        && $browserStatus['body']['bank_code'] === null
+        && $browserStatus['body']['account_number'] === null
+        && $browserStatus['body']['account_name'] === null
+        && $browserStatus['body']['subaccount_code'] === null
+        && $browserStatus['body']['is_verified'] === false,
+    'client_status must redact every settlement field for a browser-channel client, even its own owner: ' . $browserStatus['raw']
+);
+$browserBanks = request($baseUrl, 'list_banks', 'GET', null, ['Authorization: Bearer ' . $browserKey]);
+check($browserBanks['status'] === 403, 'list_banks must refuse a browser-channel client.');
+$browserSettle = request($baseUrl, 'save_settlement_details', 'POST', [
+    'business_name' => 'Should Not Save',
+    'settlement_type' => 'mpesa',
+    'bank_code' => 'MPESA',
+    'account_number' => '0700000000',
+], ['Authorization: Bearer ' . $browserKey]);
+check($browserSettle['status'] === 403, 'save_settlement_details must refuse a browser-channel client even as owner.');
+$nativeOwner = register($baseUrl, 'native-owner-device', 'native');
+check($nativeOwner['status'] === 201 && $nativeOwner['body']['api_key'] !== $browserKey, 'Could not register the native-channel control fixture.');
+// Set fake settlement data directly (not through save_settlement_details,
+// which would need a real outbound Paystack call this suite has no
+// sandbox key for) purely to give client_status something real to
+// either redact or not - the point of this control case is proving
+// native ISN'T also accidentally redacted, not exercising Paystack.
+$pdo->prepare("UPDATE shops SET business_name = 'Control Shop', subaccount_code = 'SUB_CONTROL', is_verified = 1
+    WHERE id = (SELECT shop_id FROM clients WHERE device_id = 'native-owner-device')")->execute();
+$nativeStatus = request($baseUrl, 'client_status', 'GET', null, ['Authorization: Bearer ' . $nativeOwner['body']['api_key']]);
+check($nativeStatus['status'] === 200 && ($nativeStatus['body']['business_name'] ?? null) === 'Control Shop',
+    'client_status must NOT redact settlement fields for a native-channel client (control case).');
 
 echo "Platform integration tests passed.\n";
