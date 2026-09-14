@@ -99,6 +99,26 @@ class Database
         if ($clientsTableCount < 1) {
             throw new \RuntimeException("Database bootstrap failed for {$db['name']}.");
         }
+
+        // sql/schema.sql is kept in sync with every migration under
+        // sql/migrations/ as it's written (this repo's own established
+        // convention - a fresh install gets the combined result of both
+        // at once, rather than schema.sql plus a long replay of history).
+        // That means a database just bootstrapped from schema.sql
+        // already has the effect of every migration that existed at the
+        // time this code shipped - runMigrations() must not try to
+        // re-apply them right afterward (e.g. a second ADD COLUMN for
+        // something schema.sql already includes fails outright), so mark
+        // them applied here, before runMigrations() ever runs against
+        // this connection.
+        $pdo->exec('CREATE TABLE IF NOT EXISTS schema_migrations (
+            name VARCHAR(190) NOT NULL PRIMARY KEY,
+            applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )');
+        $record = $pdo->prepare('INSERT IGNORE INTO schema_migrations (name) VALUES (?)');
+        foreach (glob(__DIR__ . '/../../sql/migrations/*.sql') ?: [] as $path) {
+            $record->execute([basename($path)]);
+        }
     }
 
     private static function quoteIdentifier(string $identifier): string
@@ -147,15 +167,53 @@ class Database
         }
     }
 
+    /**
+     * Splits a multi-statement .sql file on unquoted, uncommented
+     * semicolons. Must recognize both "--" line comments and C-style
+     * slash-star block comments as such - not just track quote
+     * characters - because this project's own migration files routinely
+     * have both apostrophes ("doesn't", "shop's") and literal semicolons
+     * inside comment prose. An earlier version only tracked quotes: an
+     * odd apostrophe count across a run of comments desynced its
+     * quote-tracking and silently merged unrelated CREATE TABLE
+     * statements into one malformed blob, and a semicolon inside a
+     * comment split a statement in half - both confirmed for real
+     * against this project's own schema.sql, not hypothetical. See
+     * tests/verify_split_sql_statements.php.
+     */
     private static function splitSqlStatements(string $sql): array
     {
         $statements = [];
         $buffer = '';
         $quote = null;
+        $inLineComment = false;
+        $inBlockComment = false;
         $length = strlen($sql);
         for ($i = 0; $i < $length; $i++) {
             $char = $sql[$i];
             $buffer .= $char;
+
+            if ($inLineComment) {
+                if ($char === "\n") {
+                    $inLineComment = false;
+                }
+                continue;
+            }
+            if ($inBlockComment) {
+                if ($char === '/' && $i > 0 && $sql[$i - 1] === '*') {
+                    $inBlockComment = false;
+                }
+                continue;
+            }
+            if ($quote === null && $char === '-' && ($sql[$i + 1] ?? '') === '-') {
+                $inLineComment = true;
+                continue;
+            }
+            if ($quote === null && $char === '/' && ($sql[$i + 1] ?? '') === '*') {
+                $inBlockComment = true;
+                continue;
+            }
+
             if (($char === "'" || $char === '"') && ($i === 0 || $sql[$i - 1] !== '\\')) {
                 if ($quote === $char) {
                     $quote = null;
