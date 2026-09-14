@@ -4,6 +4,7 @@ namespace Platform\Core;
 
 use PDO;
 use PDOException;
+use RuntimeException;
 
 /**
  * PDO singleton, mirroring C:\xampp\htdocs\pos\app\Core\Database.php -
@@ -31,6 +32,7 @@ class Database
             self::bootstrapDatabase($db);
             self::$connection = self::newPdo($dsn, $db);
         }
+        self::runMigrations(self::$connection);
         return self::$connection;
     }
 
@@ -41,16 +43,11 @@ class Database
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         ];
         if (!empty($db['ssl_ca'])) {
+            if (!is_file($db['ssl_ca']) || !is_readable($db['ssl_ca'])) {
+                throw new RuntimeException('DB_SSL_CA does not point to a readable CA certificate.');
+            }
             $options[PDO::MYSQL_ATTR_SSL_CA] = $db['ssl_ca'];
-            // Verified false, not true: confirmed by testing against the
-            // real Aiven service (mysqlnd's SQLSTATE[HY000] [2002]
-            // "Cannot connect to MySQL using SSL" fired specifically on
-            // hostname/chain verification, not on the TLS handshake
-            // itself - a plain connect and a connect with this off both
-            // succeed and negotiate real TLS 1.3, confirmed via SHOW
-            // STATUS LIKE 'Ssl_cipher'). Traffic is still encrypted;
-            // only strict cert-pinning is skipped.
-            $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
+            $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = true;
         }
         return new PDO($dsn, $db['user'], $db['pass'], $options);
     }
@@ -102,6 +99,26 @@ class Database
         if ($clientsTableCount < 1) {
             throw new \RuntimeException("Database bootstrap failed for {$db['name']}.");
         }
+
+        // sql/schema.sql is kept in sync with every migration under
+        // sql/migrations/ as it's written (this repo's own established
+        // convention - a fresh install gets the combined result of both
+        // at once, rather than schema.sql plus a long replay of history).
+        // That means a database just bootstrapped from schema.sql
+        // already has the effect of every migration that existed at the
+        // time this code shipped - runMigrations() must not try to
+        // re-apply them right afterward (e.g. a second ADD COLUMN for
+        // something schema.sql already includes fails outright), so mark
+        // them applied here, before runMigrations() ever runs against
+        // this connection.
+        $pdo->exec('CREATE TABLE IF NOT EXISTS schema_migrations (
+            name VARCHAR(190) NOT NULL PRIMARY KEY,
+            applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )');
+        $record = $pdo->prepare('INSERT IGNORE INTO schema_migrations (name) VALUES (?)');
+        foreach (glob(__DIR__ . '/../../sql/migrations/*.sql') ?: [] as $path) {
+            $record->execute([basename($path)]);
+        }
     }
 
     private static function quoteIdentifier(string $identifier): string
@@ -109,15 +126,94 @@ class Database
         return '`' . str_replace('`', '``', $identifier) . '`';
     }
 
+    private static function runMigrations(PDO $pdo): void
+    {
+        $pdo->exec('CREATE TABLE IF NOT EXISTS schema_migrations (
+            name VARCHAR(190) NOT NULL PRIMARY KEY,
+            applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )');
+
+        $databaseName = (string) $pdo->query('SELECT DATABASE()')->fetchColumn();
+        $lockName = 'nexapos_migrations_' . hash('sha1', $databaseName);
+        $lock = $pdo->prepare('SELECT GET_LOCK(?, 30)');
+        $lock->execute([$lockName]);
+        if ((int) $lock->fetchColumn() !== 1) {
+            throw new RuntimeException('Could not acquire the database migration lock.');
+        }
+
+        try {
+            $paths = glob(__DIR__ . '/../../sql/migrations/*.sql') ?: [];
+            sort($paths, SORT_STRING);
+            $exists = $pdo->prepare('SELECT COUNT(*) FROM schema_migrations WHERE name = ?');
+            $record = $pdo->prepare('INSERT INTO schema_migrations (name) VALUES (?)');
+            foreach ($paths as $path) {
+                $name = basename($path);
+                $exists->execute([$name]);
+                if ((int) $exists->fetchColumn() > 0) {
+                    continue;
+                }
+                $sql = file_get_contents($path);
+                if ($sql === false) {
+                    throw new RuntimeException("Could not read migration: $name");
+                }
+                foreach (self::splitSqlStatements($sql) as $statement) {
+                    $pdo->exec($statement);
+                }
+                $record->execute([$name]);
+            }
+        } finally {
+            $release = $pdo->prepare('SELECT RELEASE_LOCK(?)');
+            $release->execute([$lockName]);
+        }
+    }
+
+    /**
+     * Splits a multi-statement .sql file on unquoted, uncommented
+     * semicolons. Must recognize both "--" line comments and C-style
+     * slash-star block comments as such - not just track quote
+     * characters - because this project's own migration files routinely
+     * have both apostrophes ("doesn't", "shop's") and literal semicolons
+     * inside comment prose. An earlier version only tracked quotes: an
+     * odd apostrophe count across a run of comments desynced its
+     * quote-tracking and silently merged unrelated CREATE TABLE
+     * statements into one malformed blob, and a semicolon inside a
+     * comment split a statement in half - both confirmed for real
+     * against this project's own schema.sql, not hypothetical. See
+     * tests/verify_split_sql_statements.php.
+     */
     private static function splitSqlStatements(string $sql): array
     {
         $statements = [];
         $buffer = '';
         $quote = null;
+        $inLineComment = false;
+        $inBlockComment = false;
         $length = strlen($sql);
         for ($i = 0; $i < $length; $i++) {
             $char = $sql[$i];
             $buffer .= $char;
+
+            if ($inLineComment) {
+                if ($char === "\n") {
+                    $inLineComment = false;
+                }
+                continue;
+            }
+            if ($inBlockComment) {
+                if ($char === '/' && $i > 0 && $sql[$i - 1] === '*') {
+                    $inBlockComment = false;
+                }
+                continue;
+            }
+            if ($quote === null && $char === '-' && ($sql[$i + 1] ?? '') === '-') {
+                $inLineComment = true;
+                continue;
+            }
+            if ($quote === null && $char === '/' && ($sql[$i + 1] ?? '') === '*') {
+                $inBlockComment = true;
+                continue;
+            }
+
             if (($char === "'" || $char === '"') && ($i === 0 || $sql[$i - 1] !== '\\')) {
                 if ($quote === $char) {
                     $quote = null;

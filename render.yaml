@@ -28,3 +28,13 @@ services:
         sync: false
       - key: PLATFORM_DEFAULT_PERCENTAGE_CHARGE
         value: "1"
+      # --- IntaSend (see docs/deployment-runbook.md's "IntaSend
+      # collection" section) - collection works with no other setup once
+      # these are set, but leave PLATFORM_INTASEND_API_BASE on the
+      # sandbox default until verified end-to-end with real keys ---
+      - key: PLATFORM_INTASEND_SECRET_KEY
+        sync: false
+      - key: PLATFORM_INTASEND_PUBLISHABLE_KEY
+        sync: false
+      - key: PLATFORM_INTASEND_WEBHOOK_CHALLENGE
+        sync: false

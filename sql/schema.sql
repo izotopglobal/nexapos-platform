@@ -18,6 +18,13 @@ CREATE TABLE IF NOT EXISTS shops (
     subaccount_code VARCHAR(60) NULL UNIQUE,
     percentage_charge DECIMAL(5,2) NULL,
     is_verified TINYINT(1) NOT NULL DEFAULT 0,
+    -- IntaSend WORKING wallet id for this shop's collected funds - unlike
+    -- subaccount_code above, created lazily on first IntaSend collection
+    -- attempt (see ensureIntaSendWallet in public/index.php), not gated
+    -- behind a settlement form: collecting into a wallet needs no bank
+    -- details, only disbursing OUT of it does, and that step doesn't
+    -- exist yet.
+    intasend_wallet_id VARCHAR(40) NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -49,6 +56,20 @@ CREATE TABLE IF NOT EXISTS clients (
     -- specific action that needed gating, not a general permissions
     -- model the product doesn't otherwise have.
     is_owner TINYINT(1) NOT NULL DEFAULT 0,
+    -- Stamped once at register_device time from what the client itself
+    -- claims to be, never touched again (same immutable-after-creation
+    -- pattern as is_owner above) - the browser build always sends
+    -- 'browser', native always sends 'native' or omits this entirely
+    -- (defaults to 'native'). Settlement/payout endpoints refuse a
+    -- 'browser' channel outright regardless of is_owner or role - see
+    -- save_settlement_details/client_status/list_banks in public/
+    -- index.php. Defense-in-depth, not cryptographically unbeatable: a
+    -- browser build's client-side code is inherently inspectable/
+    -- patchable in a way a compiled native binary isn't, so this stops
+    -- casual/accidental exposure, not a determined attacker willing to
+    -- rebuild the web client - an accepted, deliberate trade-off, see
+    -- the browser-POS plan.
+    channel ENUM('native', 'browser') NOT NULL DEFAULT 'native',
     shop_id INT NOT NULL,
     -- Client-scoped, unlike settlement above: only means "still within
     -- its 10-min re-registration grace window" or "admin-disabled" - not
@@ -80,6 +101,61 @@ CREATE TABLE IF NOT EXISTS transactions (
     verified_at TIMESTAMP NULL,
     INDEX (client_id),
     FOREIGN KEY (client_id) REFERENCES clients(id)
+);
+
+-- Idempotency ledger for Paystack callbacks. Only hashes and the small
+-- amount of routing metadata needed for reconciliation are retained;
+-- full webhook payloads can contain customer/payment details and are
+-- deliberately not copied into this database.
+CREATE TABLE IF NOT EXISTS paystack_webhook_events (
+    event_key VARCHAR(190) NOT NULL PRIMARY KEY,
+    event_type VARCHAR(80) NOT NULL,
+    reference VARCHAR(60) NOT NULL,
+    payload_sha256 CHAR(64) NOT NULL,
+    status ENUM('received', 'processing', 'processed', 'ignored', 'failed') NOT NULL DEFAULT 'received',
+    attempts INT NOT NULL DEFAULT 1,
+    last_error VARCHAR(500) NULL,
+    received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    processed_at TIMESTAMP NULL,
+    INDEX (reference),
+    INDEX (status, updated_at)
+);
+
+-- IntaSend's sibling of transactions above - a separate table (not a
+-- shared one keyed by provider) because subaccount_code is NOT NULL
+-- there and has no IntaSend equivalent; wallet_id plays that role here.
+CREATE TABLE IF NOT EXISTS intasend_transactions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    client_id INT NOT NULL,
+    reference VARCHAR(60) NOT NULL UNIQUE,
+    invoice_id VARCHAR(60) NOT NULL,
+    amount_minor INT NOT NULL,
+    currency VARCHAR(10) NOT NULL,
+    wallet_id VARCHAR(40) NOT NULL,
+    status ENUM('initialized', 'verified_success', 'verified_failed') NOT NULL DEFAULT 'initialized',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    verified_at TIMESTAMP NULL,
+    INDEX (client_id),
+    INDEX (invoice_id),
+    FOREIGN KEY (client_id) REFERENCES clients(id)
+);
+
+-- IntaSend's sibling of paystack_webhook_events above - same idempotency
+-- shape, keyed on invoice_id + state instead of Paystack's event id.
+CREATE TABLE IF NOT EXISTS intasend_webhook_events (
+    event_key VARCHAR(190) NOT NULL PRIMARY KEY,
+    state VARCHAR(40) NOT NULL,
+    reference VARCHAR(60) NOT NULL,
+    payload_sha256 CHAR(64) NOT NULL,
+    status ENUM('received', 'processing', 'processed', 'ignored', 'failed') NOT NULL DEFAULT 'received',
+    attempts INT NOT NULL DEFAULT 1,
+    last_error VARCHAR(500) NULL,
+    received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    processed_at TIMESTAMP NULL,
+    INDEX (reference),
+    INDEX (status, updated_at)
 );
 
 -- Phase 2 sync: a shop is the grouping that lets multiple devices (phones

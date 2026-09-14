@@ -17,6 +17,10 @@ use Platform\Core\Auth;
 use Platform\Core\Database;
 use Platform\Core\InviteCode;
 use Platform\Services\PaystackClient;
+use Platform\Services\PaymentReconciler;
+use Platform\Services\IntaSendClient;
+use Platform\Services\IntaSendReconciler;
+use Platform\Services\MaintenanceService;
 
 /**
  * The 10 SyncedColumns tables on the phone (see _syncedTableNames in
@@ -80,6 +84,32 @@ function requireAdmin(array $platformConfig): void
     }
 }
 
+/**
+ * Lazily creates this shop's IntaSend WORKING wallet on first use, so
+ * collecting a payment never needs a separate "set up IntaSend" step the
+ * way Paystack's subaccount does - see IntaSendClient::createWallet's
+ * doc for why no bank details are needed up front. Idempotent: once
+ * shops.intasend_wallet_id is set, every later call just returns it.
+ */
+function ensureIntaSendWallet(PDO $pdo, array $client, IntaSendClient $intasend): string
+{
+    $existing = trim((string) ($client['intasend_wallet_id'] ?? ''));
+    if ($existing !== '') {
+        return $existing;
+    }
+
+    $label = trim((string) ($client['business_name'] ?? '')) ?: ('NexaPOS Shop #' . $client['shop_id']);
+    $result = $intasend->createWallet($label);
+    $walletId = trim((string) ($result['body']['id'] ?? ''));
+    if ($walletId === '') {
+        throw new \RuntimeException('IntaSend did not return a wallet id.');
+    }
+
+    $update = $pdo->prepare('UPDATE shops SET intasend_wallet_id = ? WHERE id = ?');
+    $update->execute([$walletId, $client['shop_id']]);
+    return $walletId;
+}
+
 set_exception_handler(function (\Throwable $e): void {
     error_log('[nexapos_platform] ' . $e->getMessage());
     jsonResponse(['success' => false, 'status' => false, 'message' => 'Server error.'], 500);
@@ -88,18 +118,91 @@ set_exception_handler(function (\Throwable $e): void {
 $pdo = Database::connection();
 $action = (string) ($_GET['action'] ?? '');
 $method = $_SERVER['REQUEST_METHOD'];
+$platformConfig = require __DIR__ . '/../config/platform.php';
 
 // Every other action here is called by the Flutter app (not subject to
-// CORS) - list_all_devices is the first one meant to be called from a
-// browser-hosted admin page on a different origin, so this needs the
-// same permissive-but-secret-gated CORS stance nexapos_license already
-// uses for its own admin actions.
-header('Access-Control-Allow-Origin: *');
+// CORS). The browser-hosted admin dashboard is granted only its
+// configured origin; holding the admin secret remains the real auth
+// boundary, while the origin allow-list reduces browser exposure.
+$origin = trim(headerValue('Origin'));
+$allowedOrigins = $platformConfig['cors_allowed_origins'] ?? [];
+if ($origin !== '' && in_array($origin, $allowedOrigins, true)) {
+    header('Access-Control-Allow-Origin: ' . $origin);
+    header('Vary: Origin');
+}
 header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Admin-Secret');
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
 if ($method === 'OPTIONS') {
+    if ($origin !== '' && !in_array($origin, $allowedOrigins, true)) {
+        jsonResponse(['success' => false, 'message' => 'Origin is not allowed.'], 403);
+    }
     http_response_code(204);
     exit;
+}
+
+if ($action === 'paystack_webhook' && $method === 'POST') {
+    $rawPayload = (string) file_get_contents('php://input');
+    if ($rawPayload === '' || strlen($rawPayload) > 1_048_576) {
+        jsonResponse(['success' => false, 'message' => 'Invalid webhook payload.'], 422);
+    }
+    if (!PaymentReconciler::hasValidSignature(
+        $rawPayload,
+        headerValue('X-Paystack-Signature'),
+        (string) $platformConfig['paystack_secret_key']
+    )) {
+        jsonResponse(['success' => false, 'message' => 'Invalid webhook signature.'], 401);
+    }
+
+    try {
+        $event = json_decode($rawPayload, true, 32, JSON_THROW_ON_ERROR);
+        if (!is_array($event)) {
+            throw new \RuntimeException('Webhook payload must be an object.');
+        }
+        $paystack = new PaystackClient();
+        $reconciler = new PaymentReconciler($pdo, [$paystack, 'verifyTransaction']);
+        $result = $reconciler->handleWebhook($event, $rawPayload);
+    } catch (\JsonException $e) {
+        jsonResponse(['success' => false, 'message' => 'Invalid webhook JSON.'], 422);
+    } catch (\Throwable $e) {
+        error_log('[nexapos_platform] Paystack webhook failed: ' . $e->getMessage());
+        jsonResponse(['success' => false, 'message' => 'Webhook processing will be retried.'], 503);
+    }
+
+    jsonResponse(['success' => true, 'outcome' => $result['outcome']]);
+}
+
+if ($action === 'intasend_webhook' && $method === 'POST') {
+    $rawPayload = (string) file_get_contents('php://input');
+    if ($rawPayload === '' || strlen($rawPayload) > 1_048_576) {
+        jsonResponse(['success' => false, 'message' => 'Invalid webhook payload.'], 422);
+    }
+
+    try {
+        $event = json_decode($rawPayload, true, 32, JSON_THROW_ON_ERROR);
+        if (!is_array($event)) {
+            throw new \RuntimeException('Webhook payload must be an object.');
+        }
+    } catch (\JsonException $e) {
+        jsonResponse(['success' => false, 'message' => 'Invalid webhook JSON.'], 422);
+    }
+
+    if (!IntaSendReconciler::hasValidChallenge(
+        (string) ($event['challenge'] ?? ''),
+        (string) $platformConfig['intasend_webhook_challenge']
+    )) {
+        jsonResponse(['success' => false, 'message' => 'Invalid webhook challenge.'], 401);
+    }
+
+    try {
+        $intasend = new IntaSendClient();
+        $reconciler = new IntaSendReconciler($pdo, [$intasend, 'status']);
+        $result = $reconciler->handleWebhook($event, $rawPayload);
+    } catch (\Throwable $e) {
+        error_log('[nexapos_platform] IntaSend webhook failed: ' . $e->getMessage());
+        jsonResponse(['success' => false, 'message' => 'Webhook processing will be retried.'], 503);
+    }
+
+    jsonResponse(['success' => true, 'outcome' => $result['outcome']]);
 }
 
 // Render's health check hits this - deliberately goes through
@@ -135,6 +238,12 @@ if ($action === 'list_all_devices' && $method === 'GET') {
         ORDER BY clients.shop_id, clients.id
     ');
     jsonResponse(['success' => true, 'devices' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+}
+
+if ($action === 'run_maintenance' && $method === 'POST') {
+    requireAdmin($platformConfig);
+    $deleted = (new MaintenanceService($pdo, $platformConfig))->run();
+    jsonResponse(['success' => true, 'deleted' => $deleted]);
 }
 
 /**
@@ -204,66 +313,88 @@ if ($action === 'register_device' && $method === 'POST') {
     // old to send one simply can't use the grace-window retry path,
     // which is the intended, safer behavior, not a bug.
     $registrationSecret = trim((string) ($body['registration_secret'] ?? ''));
+    // Stamped once here, on the brand-new-shop INSERT path only, and
+    // never touched again - same immutable-after-creation pattern as
+    // is_owner just below. An unrecognized value (or none - every native
+    // build predating this field) is treated as 'native', so this is
+    // opt-in for the browser build specifically, never something a
+    // client can accidentally leave itself gated out of.
+    $channel = ($body['channel'] ?? '') === 'browser' ? 'browser' : 'native';
     if ($deviceId === '') {
         jsonResponse(['success' => false, 'message' => 'device_id is required.'], 422);
     }
 
-    $stmt = $pdo->prepare('SELECT * FROM clients WHERE device_id = ?');
-    $stmt->execute([$deviceId]);
-    $existing = $stmt->fetch();
+    // Concurrent first registrations can deadlock on the missing device row.
+    // Retry the whole transaction so recovery always rechecks the stored secret.
+    for ($registrationAttempt = 0; $registrationAttempt < 3; $registrationAttempt++) {
+        try {
+            $pdo->beginTransaction();
+            $stmt = $pdo->prepare('SELECT * FROM clients WHERE device_id = ? FOR UPDATE');
+            $stmt->execute([$deviceId]);
+            $existing = $stmt->fetch();
 
-    $secretMatches = $existing
-        && $registrationSecret !== ''
-        && $existing['registration_secret_hash'] !== null
-        && hash_equals($existing['registration_secret_hash'], hash('sha256', $registrationSecret));
-    // Originally also required status = 'pending_settlement' AND being
-    // within 10 minutes of created_at - both dropped, approved by the
-    // user 2026-08-28. The secret match is what actually protects this
-    // (a 256-bit value never transmitted anywhere except this one call
-    // over HTTPS, generated once, stored only in this device's own
-    // local DB - see registration_secret_hash's own comment) - the
-    // extra time bound on top of an already-secret-gated retry wasn't
-    // adding real protection, it was just permanently locking out any
-    // device whose local secure storage lost its api_key (lost app
-    // data, a botched update, a factory reset that somehow kept the
-    // same local DB file) more than 10 minutes after its first
-    // registration. Still unconditionally blocked for a disabled
-    // (admin-revoked) device - status alone decides that, regardless of
-    // secret, so revoke_device/admin_revoke_device's guarantee that
-    // there's no way back in via the API is untouched.
-    $canRecover = $existing && $existing['status'] !== 'disabled' && $secretMatches;
+            $secretMatches = $existing
+                && $registrationSecret !== ''
+                && $existing['registration_secret_hash'] !== null
+                && hash_equals($existing['registration_secret_hash'], hash('sha256', $registrationSecret));
+            // Originally also required status = 'pending_settlement' AND being
+            // within 10 minutes of created_at - both dropped, approved by the
+            // user 2026-08-28. The secret match is what actually protects this
+            // (a 256-bit value never transmitted anywhere except this one call
+            // over HTTPS, generated once, stored only in this device's own
+            // local DB - see registration_secret_hash's own comment) - the
+            // extra time bound on top of an already-secret-gated retry wasn't
+            // adding real protection, it was just permanently locking out any
+            // device whose local secure storage lost its api_key (lost app
+            // data, a botched update, a factory reset that somehow kept the
+            // same local DB file) more than 10 minutes after its first
+            // registration. Still unconditionally blocked for a disabled
+            // (admin-revoked) device - status alone decides that, regardless of
+            // secret, so revoke_device/admin_revoke_device's guarantee that
+            // there's no way back in via the API is untouched.
+            $canRecover = $existing && $existing['status'] !== 'disabled' && $secretMatches;
 
-    if ($existing && !$canRecover) {
-        jsonResponse(['success' => false, 'message' => 'This device is already registered.'], 409);
-    }
+            if ($existing && !$canRecover) {
+                $pdo->rollBack();
+                jsonResponse(['success' => false, 'message' => 'This device is already registered.'], 409);
+            }
 
-    $apiKey = bin2hex(random_bytes(32));
-    $apiKeyHash = hash('sha256', $apiKey);
+            $apiKey = bin2hex(random_bytes(32));
+            $apiKeyHash = hash('sha256', $apiKey);
 
-    if ($existing) {
-        // registration_secret_hash is deliberately left untouched here -
-        // the same secret keeps working for any further retry within
-        // what's left of the original 10-minute window.
-        $update = $pdo->prepare('UPDATE clients SET device_label = ?, api_key_hash = ? WHERE id = ?');
-        $update->execute([$deviceLabel, $apiKeyHash, $existing['id']]);
-    } else {
-        // Every device starts as the sole member of a brand-new shop -
-        // joining an EXISTING shop is a separate, authenticated step
-        // (join_shop) done after registration, not a parameter here.
-        // See join_shop's own comment for why it can't live in this
-        // endpoint: the 409 above fires unconditionally for any device
-        // outside its 10-minute grace window, before an invite code
-        // would ever be read.
-        if ($registrationSecret === '') {
-            jsonResponse(['success' => false, 'message' => 'registration_secret is required.'], 422);
+            if ($existing) {
+                // registration_secret_hash is deliberately left untouched here.
+                $update = $pdo->prepare('UPDATE clients SET device_label = ?, api_key_hash = ? WHERE id = ?');
+                $update->execute([$deviceLabel, $apiKeyHash, $existing['id']]);
+            } else {
+                // Every device starts as the sole member of a brand-new shop;
+                // joining an existing shop is a separate authenticated step.
+                if ($registrationSecret === '') {
+                    $pdo->rollBack();
+                    jsonResponse(['success' => false, 'message' => 'registration_secret is required.'], 422);
+                }
+                $registrationSecretHash = hash('sha256', $registrationSecret);
+                $pdo->exec('INSERT INTO shops () VALUES ()');
+                $shopId = (int) $pdo->lastInsertId();
+                $insert = $pdo->prepare('INSERT INTO clients (device_id, device_label, api_key_hash, registration_secret_hash, shop_id, is_owner, channel) VALUES (?, ?, ?, ?, ?, 1, ?)');
+                $insert->execute([$deviceId, $deviceLabel, $apiKeyHash, $registrationSecretHash, $shopId, $channel]);
+            }
+            $pdo->commit();
+            break;
+        } catch (\PDOException $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            $driverCode = (int) ($e->errorInfo[1] ?? 0);
+            if ($registrationAttempt < 2 && in_array($driverCode, [1062, 1205, 1213], true)) {
+                usleep(random_int(10000, 50000));
+                continue;
+            }
+            if ((int) $e->getCode() === 23000) {
+                jsonResponse(['success' => false, 'message' => 'This device is already registered.'], 409);
+            }
+            throw $e;
         }
-        $registrationSecretHash = hash('sha256', $registrationSecret);
-        $pdo->exec('INSERT INTO shops () VALUES ()');
-        $shopId = (int) $pdo->lastInsertId();
-        // is_owner = 1: this device founded the shop it's about to be
-        // the sole member of - see clients.is_owner's schema comment.
-        $insert = $pdo->prepare('INSERT INTO clients (device_id, device_label, api_key_hash, registration_secret_hash, shop_id, is_owner) VALUES (?, ?, ?, ?, ?, 1)');
-        $insert->execute([$deviceId, $deviceLabel, $apiKeyHash, $registrationSecretHash, $shopId]);
     }
 
     jsonResponse(['success' => true, 'api_key' => $apiKey], 201);
@@ -363,17 +494,41 @@ if ($action === 'join_shop' && $method === 'POST') {
     // Atomic claim: an UPDATE that only succeeds once, so two concurrent
     // redemptions of the same code can never both pass (no separate
     // SELECT-then-UPDATE race).
-    $claim = $pdo->prepare('UPDATE shop_invites SET used_at = UTC_TIMESTAMP() WHERE code = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()');
-    $claim->execute([$code]);
-    if ($claim->rowCount() !== 1) {
+    $pdo->beginTransaction();
+    try {
+        $claim = $pdo->prepare('UPDATE shop_invites SET used_at = UTC_TIMESTAMP() WHERE code = ? AND used_at IS NULL AND expires_at > UTC_TIMESTAMP()');
+        $claim->execute([$code]);
+        if ($claim->rowCount() !== 1) {
+            $pdo->rollBack();
+            $log = $pdo->prepare('INSERT INTO join_attempts (client_id, ip_address) VALUES (?, ?)');
+            $log->execute([$client['id'], $ip]);
+            jsonResponse(['success' => false, 'message' => 'Invalid or expired invite code.'], 422);
+        }
+
+        $invite = $pdo->prepare('SELECT shop_id FROM shop_invites WHERE code = ?');
+        $invite->execute([$code]);
+        $newShopId = (int) $invite->fetchColumn();
+
+        if ($newShopId <= 0 || $newShopId === (int) $client['shop_id']) {
+            $pdo->rollBack();
+            jsonResponse(['success' => false, 'message' => 'Choose an invite for a different shop.'], 422);
+        }
+
+        $update = $pdo->prepare('UPDATE clients SET shop_id = ?, is_owner = 0 WHERE id = ?');
+        $update->execute([$newShopId, $client['id']]);
+        $pdo->commit();
+    } catch (\Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
+    }
+
+    if ($newShopId <= 0) {
         $log = $pdo->prepare('INSERT INTO join_attempts (client_id, ip_address) VALUES (?, ?)');
         $log->execute([$client['id'], $ip]);
         jsonResponse(['success' => false, 'message' => 'Invalid or expired invite code.'], 422);
     }
-
-    $invite = $pdo->prepare('SELECT shop_id FROM shop_invites WHERE code = ?');
-    $invite->execute([$code]);
-    $newShopId = (int) $invite->fetchColumn();
 
     // is_owner reset to 0: this device is redeeming someone ELSE's
     // invite code, so by definition it didn't found the shop it's about
@@ -383,9 +538,6 @@ if ($action === 'join_shop' && $method === 'POST') {
     // reset, a solo device that founded its own shop (is_owner=1) could
     // join_shop into a different, unrelated shop and incorrectly
     // inherit owner-only settlement rights there.
-    $update = $pdo->prepare('UPDATE clients SET shop_id = ?, is_owner = 0 WHERE id = ?');
-    $update->execute([$newShopId, $client['id']]);
-
     jsonResponse(['success' => true, 'shop_id' => $newShopId]);
 }
 
@@ -410,20 +562,32 @@ if ($action === 'leave_shop' && $method === 'POST') {
 
     $coTenants = $pdo->prepare('SELECT COUNT(*) FROM clients WHERE shop_id = ?');
     $coTenants->execute([$client['shop_id']]);
-    if ((int) $coTenants->fetchColumn() > 1) {
-        jsonResponse(['success' => false, 'message' => 'This device shares its shop with other devices - ask the shop owner to remove it from Device Management instead.'], 409);
+    if ((int) $coTenants->fetchColumn() > 1 && (bool) $client['is_owner']) {
+        jsonResponse(['success' => false, 'message' => 'The owner cannot leave while other devices belong to this shop. Remove those devices first.'], 409);
     }
 
-    $pdo->exec('INSERT INTO shops () VALUES ()');
-    $newShopId = (int) $pdo->lastInsertId();
-    $update = $pdo->prepare('UPDATE clients SET shop_id = ?, is_owner = 1 WHERE id = ?');
-    $update->execute([$newShopId, $client['id']]);
+    $pdo->beginTransaction();
+    try {
+        $pdo->exec('INSERT INTO shops () VALUES ()');
+        $newShopId = (int) $pdo->lastInsertId();
+        $update = $pdo->prepare('UPDATE clients SET shop_id = ?, is_owner = 1 WHERE id = ?');
+        $update->execute([$newShopId, $client['id']]);
+        $pdo->commit();
+    } catch (\Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
+    }
 
     jsonResponse(['success' => true, 'shop_id' => $newShopId]);
 }
 
 if ($action === 'generate_invite' && $method === 'POST') {
     $client = Auth::requireClient($pdo);
+    if (!(bool) $client['is_owner']) {
+        jsonResponse(['success' => false, 'message' => 'Only the shop owner can invite devices.'], 403);
+    }
     $platformConfig = require __DIR__ . '/../config/platform.php';
     $expiryMinutes = (int) $platformConfig['sync_invite_expiry_minutes'];
 
@@ -491,6 +655,10 @@ if ($action === 'push_changes' && $method === 'POST') {
     if (!is_array($changes)) {
         jsonResponse(['success' => false, 'message' => 'changes must be an array.'], 422);
     }
+    $legacyBatchLimit = max(200, min(5000, (int) ($platformConfig['sync_legacy_batch_limit'] ?? 1000)));
+    if (count($changes) > $legacyBatchLimit) {
+        jsonResponse(['success' => false, 'message' => "A sync batch may contain at most $legacyBatchLimit changes."], 413);
+    }
 
     $insert = $pdo->prepare('
         INSERT INTO sync_changes (shop_id, table_name, row_id, device_id, local_rev, updated_at, payload)
@@ -505,18 +673,38 @@ if ($action === 'push_changes' && $method === 'POST') {
         // category) always has a lower rev than a child that references
         // it (e.g. a product). Preserving push order preserves that
         // invariant for every other device's pull.
+        $encodedBytes = 0;
+        $requestByteLimit = max(1_048_576, min(67_108_864, (int) ($platformConfig['sync_request_payload_limit_bytes'] ?? 16_777_216)));
         foreach ($changes as $change) {
+            if (!is_array($change)) {
+                throw new \RuntimeException('Malformed change entry.');
+            }
             $tableName = (string) ($change['table_name'] ?? '');
             $rowId = (string) ($change['row_id'] ?? '');
             $localRev = (int) ($change['local_rev'] ?? 0);
             $updatedAt = (string) ($change['updated_at'] ?? '');
             $payload = $change['payload'] ?? null;
-            if (!in_array($tableName, SYNCED_TABLE_NAMES, true) || $rowId === '' || $updatedAt === '' || !is_array($payload)) {
+            if (!in_array($tableName, SYNCED_TABLE_NAMES, true)
+                || $rowId === '' || strlen($rowId) > 40
+                || $localRev < 1
+                || $updatedAt === '' || strlen($updatedAt) > 40
+                || !is_array($payload)
+                || (string) ($payload['id'] ?? '') !== $rowId
+                || (int) ($payload['localRev'] ?? 0) !== $localRev
+                || (string) ($payload['updatedAt'] ?? '') !== $updatedAt) {
                 throw new \RuntimeException('Malformed change entry.');
+            }
+            $encodedPayload = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+            if (strlen($encodedPayload) > 262144) {
+                throw new \RuntimeException('Change payload is too large.');
+            }
+            $encodedBytes += strlen($encodedPayload);
+            if ($encodedBytes > $requestByteLimit) {
+                throw new \RuntimeException('Sync request payload is too large.');
             }
             $insert->execute([
                 $client['shop_id'], $tableName, $rowId, $client['device_id'], $localRev, $updatedAt,
-                json_encode($payload, JSON_UNESCAPED_SLASHES),
+                $encodedPayload,
             ]);
         }
         $pdo->commit();
@@ -537,12 +725,12 @@ if ($action === 'push_changes' && $method === 'POST') {
         jsonResponse(['success' => false, 'message' => 'Could not record changes.'], 422);
     }
 
-    jsonResponse(['success' => true, 'count' => count($changes)]);
+    jsonResponse(['success' => true, 'count' => count($changes), 'recommended_batch_size' => 200]);
 }
 
 if ($action === 'pull_changes' && $method === 'GET') {
     $client = Auth::requireClient($pdo);
-    $since = (int) ($_GET['since'] ?? 0);
+    $since = max(0, (int) ($_GET['since'] ?? 0));
 
     $stmt = $pdo->prepare('
         SELECT id, table_name, row_id, device_id, local_rev, updated_at, payload
@@ -581,6 +769,14 @@ if ($action === 'save_settlement_details' && $method === 'POST') {
     // client_status, just not change it.
     if (!$client['is_owner']) {
         jsonResponse(['success' => false, 'message' => 'Only the device that originally set up this shop can change settlement details.'], 403);
+    }
+    // Independent of is_owner above, not a replacement for it: a browser
+    // build's own first-run setup could otherwise register a brand-new
+    // shop and legitimately BE its owner - the channel gate exists
+    // specifically so "owner" still isn't enough once the device is a
+    // browser tab. See clients.channel's own schema comment.
+    if ($client['channel'] === 'browser') {
+        jsonResponse(['success' => false, 'message' => 'Settlement details cannot be changed from a browser session. Use the installed app on a phone or PC instead.'], 403);
     }
 
     $body = requestBody();
@@ -635,16 +831,26 @@ if ($action === 'save_settlement_details' && $method === 'POST') {
 
 if ($action === 'client_status' && $method === 'GET') {
     $client = Auth::requireClient($pdo);
+    // A browser client never sees where a shop's money actually goes -
+    // not even read-only, not even as the shop's own owner (see
+    // save_settlement_details' matching gate and clients.channel's
+    // schema comment for why is_owner alone isn't the boundary here).
+    // shop_id/status/is_owner stay - every other consumer of this
+    // response (sync_service.dart, license_service.dart,
+    // shop_safety_service.dart) only ever reads those three fields, never
+    // the settlement ones, confirmed by inspection before adding this.
+    $isBrowser = $client['channel'] === 'browser';
     jsonResponse([
         'success' => true,
+        'shop_id' => (int) $client['shop_id'],
         'status' => $client['status'],
-        'business_name' => $client['business_name'],
-        'settlement_type' => $client['settlement_type'],
-        'bank_code' => $client['bank_code'],
-        'account_number' => $client['account_number'],
-        'account_name' => $client['account_name'],
-        'subaccount_code' => $client['subaccount_code'],
-        'is_verified' => (bool) $client['is_verified'],
+        'business_name' => $isBrowser ? null : $client['business_name'],
+        'settlement_type' => $isBrowser ? null : $client['settlement_type'],
+        'bank_code' => $isBrowser ? null : $client['bank_code'],
+        'account_number' => $isBrowser ? null : $client['account_number'],
+        'account_name' => $isBrowser ? null : $client['account_name'],
+        'subaccount_code' => $isBrowser ? null : $client['subaccount_code'],
+        'is_verified' => $isBrowser ? false : (bool) $client['is_verified'],
         // Lets the app show/hide or disable the settlement form up
         // front instead of a non-owner device filling it in and only
         // then hitting save_settlement_details' 403.
@@ -653,7 +859,13 @@ if ($action === 'client_status' && $method === 'GET') {
 }
 
 if ($action === 'list_banks' && $method === 'GET') {
-    Auth::requireClient($pdo);
+    $client = Auth::requireClient($pdo);
+    // No legitimate reason a browser client would ever need this list -
+    // it only exists to populate save_settlement_details' form, which is
+    // already unconditionally blocked for this channel above.
+    if ($client['channel'] === 'browser') {
+        jsonResponse(['success' => false, 'message' => 'Not available from a browser session.'], 403);
+    }
 
     try {
         $result = (new PaystackClient())->listBanks();
@@ -739,39 +951,109 @@ if ($action === 'verify_transaction' && $method === 'GET') {
         jsonResponse(['status' => false, 'message' => 'reference is required.'], 422);
     }
 
-    // Scoped to the calling client - a reference that exists but belongs
-    // to a different client must look identical to one that doesn't
-    // exist at all. This is the fix for the cross-client verify leak:
-    // Paystack's own verify endpoint has no concept of subaccount
-    // ownership, so that check has to happen here, before ever calling
-    // Paystack, not after.
-    $stmt = $pdo->prepare('SELECT * FROM transactions WHERE reference = ? AND client_id = ?');
-    $stmt->execute([$reference, $client['id']]);
-    $transaction = $stmt->fetch();
-    if (!$transaction) {
-        jsonResponse(['status' => false, 'message' => 'Transaction not found.'], 404);
-    }
-
     try {
-        $result = (new PaystackClient())->verifyTransaction($reference);
+        $paystack = new PaystackClient();
+        $reconciler = new PaymentReconciler($pdo, [$paystack, 'verifyTransaction']);
+        $verification = $reconciler->verifyForClient($reference, (int) $client['id']);
     } catch (\Throwable $e) {
         jsonResponse(['status' => false, 'message' => 'Could not reach Paystack: ' . $e->getMessage()], 502);
     }
 
-    $paystackStatus = strtolower((string) ($result['body']['data']['status'] ?? ''));
-    if ($paystackStatus === 'success') {
-        $localStatus = 'verified_success';
-    } elseif (in_array($paystackStatus, ['failed', 'abandoned', 'reversed'], true)) {
-        $localStatus = 'verified_failed';
-    } else {
-        $localStatus = null; // still pending - leave the local record as 'initialized'
+    if ($verification['outcome'] === 'not_found') {
+        jsonResponse(['status' => false, 'message' => 'Transaction not found.'], 404);
     }
-    if ($localStatus !== null) {
-        $update = $pdo->prepare('UPDATE transactions SET status = ?, verified_at = NOW() WHERE id = ?');
-        $update->execute([$localStatus, $transaction['id']]);
+    if ($verification['outcome'] === 'mismatch') {
+        jsonResponse(['status' => false, 'message' => 'Transaction verification details did not match the original request.'], 409);
     }
 
+    $result = $verification['paystack_result'];
     jsonResponse($result['body'], $result['http_code']);
+}
+
+/**
+ * IntaSend's sibling of initialize_transaction - deliberately has no
+ * subaccount_code-style gate, since collecting into a wallet needs no
+ * settlement details (see ensureIntaSendWallet's doc). Every device in
+ * every shop can accept an IntaSend payment the moment it's registered.
+ */
+if ($action === 'intasend_collect' && $method === 'POST') {
+    $client = Auth::requireClient($pdo);
+    $body = requestBody();
+    $amount = (int) ($body['amount'] ?? 0);
+    $reference = trim((string) ($body['reference'] ?? ''));
+    $phone = trim((string) ($body['phone_number'] ?? ''));
+    $name = trim((string) ($body['name'] ?? '')) ?: null;
+    $email = trim((string) ($body['email'] ?? '')) ?: null;
+
+    // Same upper bound as initialize_transaction, same reasoning.
+    if ($amount < 1 || $amount > 100_000_000 || $reference === '') {
+        jsonResponse(['status' => false, 'message' => 'amount and reference are required.'], 422);
+    }
+    // Kenyan MSISDN in international format (2547xxxxxxxx / 2541xxxxxxxx)
+    // - the shape IntaSend's M-Pesa STK push expects. The app is
+    // expected to have already normalized a local "07xx"/"+254 7xx"
+    // entry before this call; this is a server-side safety net, not the
+    // primary UX validation.
+    if (!preg_match('/^254\d{9}$/', $phone)) {
+        jsonResponse(['status' => false, 'message' => 'Enter a valid M-Pesa number, starting with 254.'], 422);
+    }
+
+    try {
+        $intasend = new IntaSendClient();
+        $walletId = ensureIntaSendWallet($pdo, $client, $intasend);
+        $result = $intasend->mpesaStkPush($amount, $phone, $reference, $name, $email, $walletId);
+    } catch (\Throwable $e) {
+        jsonResponse(['status' => false, 'message' => 'Could not reach IntaSend: ' . $e->getMessage()], 502);
+    }
+
+    $invoice = (array) ($result['body']['invoice'] ?? []);
+    // Both field names seen across IntaSend's own official SDK example
+    // (invoice_id) and their prose docs' sample JSON (id) - see
+    // IntaSendClient's class doc. Accepting either is cheap insurance
+    // against exactly the kind of drift that already happened once.
+    $invoiceId = trim((string) ($invoice['invoice_id'] ?? $invoice['id'] ?? ''));
+    if ($result['http_code'] >= 400 || $invoiceId === '') {
+        $message = (string) ($result['body']['detail'] ?? $result['body']['message'] ?? 'IntaSend did not accept the request.');
+        jsonResponse(['status' => false, 'message' => $message], $result['http_code'] >= 400 ? $result['http_code'] : 502);
+    }
+
+    // Same "don't turn a real charge attempt into a 500" reasoning as
+    // initialize_transaction's own insert - the STK push has already
+    // been sent to the customer's phone by this point.
+    try {
+        $insert = $pdo->prepare('
+            INSERT INTO intasend_transactions (client_id, reference, invoice_id, amount_minor, currency, wallet_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ');
+        $insert->execute([$client['id'], $reference, $invoiceId, $amount, 'KES', $walletId]);
+    } catch (\Throwable $e) {
+        error_log('[nexapos_platform] Could not record intasend transaction (reference=' . $reference . '): ' . $e->getMessage());
+    }
+
+    jsonResponse(['status' => true, 'data' => ['reference' => $reference, 'invoice_id' => $invoiceId]]);
+}
+
+if ($action === 'intasend_status' && $method === 'GET') {
+    $client = Auth::requireClient($pdo);
+    $reference = trim((string) ($_GET['reference'] ?? ''));
+    if ($reference === '') {
+        jsonResponse(['status' => false, 'message' => 'reference is required.'], 422);
+    }
+
+    try {
+        $intasend = new IntaSendClient();
+        $reconciler = new IntaSendReconciler($pdo, [$intasend, 'status']);
+        $verification = $reconciler->verifyForClient($reference, (int) $client['id']);
+    } catch (\Throwable $e) {
+        jsonResponse(['status' => false, 'message' => 'Could not reach IntaSend: ' . $e->getMessage()], 502);
+    }
+
+    if ($verification['outcome'] === 'not_found') {
+        jsonResponse(['status' => false, 'message' => 'Transaction not found.'], 404);
+    }
+
+    $response = $verification['response'];
+    jsonResponse($response['body'], $response['http_code']);
 }
 
 jsonResponse(['success' => false, 'status' => false, 'message' => 'Unknown action.'], 404);

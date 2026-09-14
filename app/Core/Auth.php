@@ -35,7 +35,7 @@ class Auth
         $stmt = $pdo->prepare('
             SELECT clients.*, shops.business_name, shops.settlement_type, shops.bank_code,
                    shops.account_number, shops.account_name, shops.subaccount_code,
-                   shops.percentage_charge, shops.is_verified
+                   shops.percentage_charge, shops.is_verified, shops.intasend_wallet_id
             FROM clients
             JOIN shops ON shops.id = clients.shop_id
             WHERE clients.api_key_hash = ?
@@ -88,7 +88,11 @@ class Auth
         // 2 minutes, so this naturally reflects real recent activity.
         // Fire-and-forget: never worth failing an otherwise-successful
         // request over this bookkeeping write.
-        $pdo->prepare('UPDATE clients SET last_seen_at = UTC_TIMESTAMP() WHERE id = ?')->execute([$client['id']]);
+        try {
+            $pdo->prepare('UPDATE clients SET last_seen_at = UTC_TIMESTAMP() WHERE id = ?')->execute([$client['id']]);
+        } catch (\Throwable $e) {
+            error_log('[nexapos_platform] Could not update last_seen_at: ' . $e->getMessage());
+        }
         return $client;
     }
 }
